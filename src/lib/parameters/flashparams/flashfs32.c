@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2015 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2022 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -32,7 +32,7 @@
  ****************************************************************************/
 
 /**
- * @file flashparam.c
+ * @file flashfs32.c
  *
  * Global flash based parameter store.
  *
@@ -40,6 +40,10 @@
  * parameter system but replace the IO with non file based flash
  * i/o routines. So that the code my be implemented on a SMALL memory
  * foot print device.
+ *
+ * It was made to provide flashfs functionality on the STM32H7 chip,
+ * which uses 32-byte flash lines that cannot be overwritten because of
+ * on-board CRC functionality.
  */
 
 #include <px4_platform_common/defines.h>
@@ -56,11 +60,13 @@
 #include <nuttx/progmem.h>
 #include <board_config.h>
 
-#if defined(CONFIG_ARCH_HAVE_PROGMEM) || defined(BOARD_USE_EXTERNAL_FLASH)
+#if defined(CONFIG_ARCH_HAVE_PROGMEM)
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
+
+#define FLASH_FLAG_ROW_SIZE 16 ///< size in h_flag_t units of a flash row
 
 /****************************************************************************
  * Private Types
@@ -77,25 +83,28 @@ typedef enum  flash_config_t {
 	BlankSig     = 0xffffffff
 } flash_config_t;
 
+/* Aligns are done up to 32 bytes, so storing the size padding within 0x001f mask */
 typedef enum  flash_flags_t {
-	SizeMask      = 0x0003,
+	SizeMask      = 0x001f,
 	MaskEntry     = ~SizeMask,
 	BlankEntry    = (h_flag_t)BlankSig,
 	ValidEntry    = (0xa5ac & ~SizeMask),
 	ErasedEntry   = 0x0000,
 } flash_flags_t;
 
-
-/* The struct flash_entry_header_t will be sizeof(uint32_t) aligned
+/* The struct flash_entry_header_t will be 32-byte aligned
  * The Size will be the actual length of the header plus the data
  * and any padding needed to have the size be an even multiple of
- * sizeof(uint32_t)
+ * the 32-byte flash line
  */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
 typedef begin_packed_struct struct flash_entry_header_t {
 	h_magic_t            magic;           /* Used to ID files*/
-	h_flag_t             flag;            /* Used to erase this entry */
+	h_flag_t             flag;            /* Used to mark this entry as valid */
+	uint8_t              unused_buffer[32 - sizeof(h_magic_t) - sizeof(h_flag_t)]; /* padding */
+	h_flag_t             flag_erased;     /* Used to erase this entry */
+	uint8_t              unused_buffer2[32 - sizeof(h_flag_t)]; /* padding */
 	uint32_t             crc;             /* Calculated over the size - end of data */
 	h_size_t             size;            /* When added to a byte pointer to flash_entry_header_t
                                                * Will result the offset of the next active file or
@@ -115,7 +124,6 @@ static uint8_t *working_buffer;
 static uint16_t working_buffer_size;
 static bool working_buffer_static;
 static sector_descriptor_t *sector_map;
-static int last_erased;
 
 /****************************************************************************
  * Public Data
@@ -240,6 +248,7 @@ static inline int blank_magic(h_magic_t *pm)
 {
 	return *pm == BlankSig;
 }
+
 /****************************************************************************
  * Name: erased_entry
  *
@@ -257,7 +266,7 @@ static inline int blank_magic(h_magic_t *pm)
 
 static inline int erased_entry(flash_entry_header_t *fi)
 {
-	return (fi->flag & MaskEntry) == ErasedEntry;
+	return (fi->flag_erased & MaskEntry) == ErasedEntry;
 }
 
 /****************************************************************************
@@ -277,7 +286,7 @@ static inline int erased_entry(flash_entry_header_t *fi)
 
 static inline int blank_entry(flash_entry_header_t *fi)
 {
-	return fi->magic == BlankSig  &&  fi->flag == BlankEntry;
+	return fi->magic == BlankSig && fi->flag == BlankEntry && fi->flag_erased == BlankEntry;
 }
 
 /****************************************************************************
@@ -297,7 +306,7 @@ static inline int blank_entry(flash_entry_header_t *fi)
 
 static inline int valid_entry(flash_entry_header_t *fi)
 {
-	return (fi->flag & MaskEntry) == ValidEntry;
+	return (fi->flag & MaskEntry) == ValidEntry && (fi->flag_erased) == BlankEntry;
 }
 
 /****************************************************************************
@@ -642,8 +651,8 @@ static sector_descriptor_t *get_sector_info(flash_entry_header_t *current)
  *
  * Description:
  *   Given a pointer to sector_descriptor_t, this function
- *   erases the sector and updates the last_erased using
- *   the pointer to the flash_entry_header_t as a sanity check
+ *   erases the sector using the pointer to the
+ *   flash_entry_header_t as a sanity check
  *
  * Input Parameters:
  *   sm      - A pointer to the current sector_descriptor_t
@@ -658,23 +667,41 @@ static sector_descriptor_t *get_sector_info(flash_entry_header_t *current)
 static int erase_sector(sector_descriptor_t *sm, flash_entry_header_t *pf)
 {
 	int rv = 0;
-#if defined(BOARD_USE_EXTERNAL_FLASH)
-	ssize_t block = up_progmem_ext_getpage((size_t)pf);
-#else
-	ssize_t block = up_progmem_getpage((size_t)pf);
-#endif
 
-	if (block > 0 && block == sm->page) {
-		last_erased = sm->page;
-#if defined(BOARD_USE_EXTERNAL_FLASH)
-		ssize_t size = up_progmem_ext_eraseblock(block);
-#else
-		ssize_t size = up_progmem_eraseblock(block);
-#endif
+	/*
+	* Because up_progmem interface doesn't allow one-to-one check of
+	* the block number for an address, use uniform-memory assumption
+	* to confirm the block number in the sector descriptor is
+	* the correct block to erase for the given address.
+	*
+	* This is an optional sanity check against the sector configuration
+	*/
+	if (up_progmem_isuniform()) {
+		ssize_t page = up_progmem_getpage((size_t)pf);
 
-		if (size < 0 || size != (ssize_t)sm->size) {
-			rv = size;
+		if (page < 0) {
+			rv = page;
 		}
+
+		if (rv == 0) {
+			size_t page_size  = up_progmem_pagesize(page);
+			size_t block_size = up_progmem_erasesize(sm->page);
+			size_t block_num  = ((page * page_size) / block_size);
+
+			if (block_num != sm->page) {
+				rv = -EINVAL;
+			}
+		}
+	}
+
+	if (rv == 0) {
+
+		ssize_t size_erased = up_progmem_eraseblock(sm->page);
+
+		if (size_erased < 0 || size_erased != (ssize_t)sm->size) {
+			rv = size_erased;
+		}
+
 	}
 
 	return rv;
@@ -698,13 +725,11 @@ static int erase_sector(sector_descriptor_t *sm, flash_entry_header_t *pf)
 
 static int erase_entry(flash_entry_header_t *pf)
 {
-	h_flag_t data = ErasedEntry;
-	size_t size = sizeof(h_flag_t);
-#if defined(BOARD_USE_EXTERNAL_FLASH)
-	int rv = up_progmem_ext_write((size_t) &pf->flag, &data, size);
-#else
-	int rv = up_progmem_write((size_t) &pf->flag, &data, size);
-#endif
+	/* Need to write entire 32-byte line */
+	h_flag_t data[FLASH_FLAG_ROW_SIZE] = {0xffff};
+	data[0] = ErasedEntry;
+	size_t size = FLASH_FLAG_ROW_SIZE * sizeof(h_flag_t);
+	int rv = up_progmem_write((size_t) &pf->flag_erased, data, size);
 	return rv;
 }
 
@@ -715,9 +740,9 @@ static int erase_entry(flash_entry_header_t *pf)
  *   Given a pointer to a flash entry header and a new size
  *
  * Input Parameters:
-*   pf       - A pointer to the current flash entry header
+ *   pf       - A pointer to the current flash entry header
  *   new_size - The total number of bytes to be written
-  *
+ *
  * Returned value:
  *  0 if there is enough space left to write new size
  *  If not it returns the flash_file_sector_t * that needs to be erased.
@@ -738,6 +763,52 @@ static sector_descriptor_t *check_free_space_in_sector(flash_entry_header_t
 
 	return sm;
 }
+
+/****************************************************************************
+ * Name: write_flash_entry
+ *
+ * Description:
+ *   Writes a 32-byte-aligned flash entry to flash memory
+ *   Notably, does not write the flag_erased line, but reports
+ *   the line as written regardless; the line's contents must remain
+ *   unwritten to avoid possible CRC errors in hardware later while erasing.
+ *
+ * Input Parameters:
+ *   pf       - Address in flash to which to write
+ *   pn       - Pointer to flash_entry_header_t to which to write
+ *
+ * Returned value:
+ *   On success the number of bytes written (including the unwritten
+ *     flag_erased line). On Error, a negative value of errno
+ *
+ ****************************************************************************/
+
+static int write_flash_entry(size_t pf, const flash_entry_header_t *pn)
+{
+	ssize_t rv;
+	size_t line_size = up_progmem_pagesize(up_progmem_getpage(pf));
+	uint8_t *first_flag_line  = (uint8_t *)pn;
+	uint8_t *content_buffer   = (uint8_t *)(&pn->crc);
+
+	/* write first line (magic, flag) */
+	rv = up_progmem_write(pf, first_flag_line, line_size);
+
+	if (rv < 0) {
+		return rv;
+	}
+
+	/* pretend to write the second line (flag_erased) */
+	rv += line_size;
+
+	/* write the remaining contents */
+	ssize_t rv2 = up_progmem_write(pf + 2 * line_size, content_buffer, pn->size - 2 * line_size);
+
+	if (rv2 < 0) {
+		return rv2;
+	}
+
+	return rv + rv2;
+}//write_flash_entry
 
 /****************************************************************************
  * Public Functions
@@ -811,9 +882,8 @@ parameter_flashfs_write(flash_file_token_t token, uint8_t *buffer, size_t buf_si
 		rv = 0;
 
 		/* Calculate the total space needed */
-
 		size_t total_size = buf_size + sizeof(flash_entry_header_t);
-		size_t alignment = sizeof(h_magic_t) - 1;
+		size_t alignment = SizeMask;///< 32-byte flash row
 		size_t  size_adjust = ((total_size + alignment) & ~alignment) - total_size;
 		total_size += size_adjust;
 
@@ -824,7 +894,6 @@ parameter_flashfs_write(flash_file_token_t token, uint8_t *buffer, size_t buf_si
 		if (!pf) {
 
 			/* No Entry exists for this token so find a place for it */
-
 			pf = find_free(total_size);
 
 			/* No Space */
@@ -890,8 +959,7 @@ parameter_flashfs_write(flash_file_token_t token, uint8_t *buffer, size_t buf_si
 				if (!blank_check(pf, total_size)) {
 					rv = erase_sector(current_sector, pf);
 				}
-
-			}
+			}//free_space_in_sector returned not-zero
 
 		}
 
@@ -906,11 +974,7 @@ parameter_flashfs_write(flash_file_token_t token, uint8_t *buffer, size_t buf_si
 		}
 
 		pn->crc = crc32(entry_crc_start(pn), entry_crc_length(pn));
-#if defined(BOARD_USE_EXTERNAL_FLASH)
-		rv = up_progmem_ext_write((size_t) pf, pn, pn->size);
-#else
-		rv = up_progmem_write((size_t) pf, pn, pn->size);
-#endif
+		rv = write_flash_entry((size_t)pf, pn);
 		int system_bytes = (sizeof(flash_entry_header_t) + size_adjust);
 
 		if (rv >= system_bytes) {
@@ -953,7 +1017,7 @@ int parameter_flashfs_alloc(flash_file_token_t token, uint8_t **buffer, size_t *
 
 		if (!working_buffer_static) {
 
-			working_buffer_size = *buf_size + sizeof(flash_entry_header_t);
+			working_buffer_size = *buf_size + sizeof(flash_entry_header_t) + SizeMask;
 			working_buffer = malloc(working_buffer_size);
 
 		}
@@ -968,7 +1032,7 @@ int parameter_flashfs_alloc(flash_file_token_t token, uint8_t **buffer, size_t *
 
 			/* We have a buffer reserve space and init it */
 			*buffer = &working_buffer[sizeof(flash_entry_header_t)];
-			*buf_size = working_buffer_size - sizeof(flash_entry_header_t);
+			*buf_size = working_buffer_size - sizeof(flash_entry_header_t) - SizeMask;
 			memset(working_buffer, 0xff, working_buffer_size);
 			rv = 0;
 
@@ -1013,6 +1077,7 @@ int parameter_flashfs_erase(void)
 	return rv;
 }
 
+
 /****************************************************************************
  * Name: parameter_flashfs_init
  *
@@ -1053,17 +1118,16 @@ int parameter_flashfs_init(sector_descriptor_t *fconfig, uint8_t *buffer, uint16
 
 	working_buffer = buffer;
 	working_buffer_size = size;
-	last_erased = -1;
 
 	/* Sanity check */
 
 	flash_entry_header_t *pf = find_entry(parameters_token);
 
-	/*  No parameters */
+	/*  No paramaters */
 
 	if (pf == NULL) {
 		size_t total_size = size + sizeof(flash_entry_header_t);
-		size_t alignment = sizeof(h_magic_t) - 1;
+		size_t alignment = 31;//32-byte flash line - 1
 		size_t  size_adjust = ((total_size + alignment) & ~alignment) - total_size;
 		total_size += size_adjust;
 
@@ -1071,7 +1135,7 @@ int parameter_flashfs_init(sector_descriptor_t *fconfig, uint8_t *buffer, uint16
 
 		if (find_free(total_size) == NULL) {
 
-			/* No paramates and no free space => neeed erase */
+			/* No parameters and no free space => need erase */
 
 			rv  = parameter_flashfs_erase();
 		}
@@ -1083,8 +1147,8 @@ int parameter_flashfs_init(sector_descriptor_t *fconfig, uint8_t *buffer, uint16
 #if defined(FLASH_UNIT_TEST)
 
 static sector_descriptor_t  test_sector_map[] = {
-	{1, 16 * 1024, 0x08004000},
-	{2, 16 * 1024, 0x08008000},
+	{14, 128 * 1024, 0x081c0000},
+	{15, 128 * 1024, 0x081e0000},
 	{0, 0, 0},
 };
 
@@ -1094,7 +1158,7 @@ uint8_t test_buf[32 * 1024];
 
 __EXPORT void test(void)
 {
-	uint16_t largest_block = (32 * 1024) + 32;
+	uint16_t largest_block = (32 * 1024) + 96;
 	uint8_t *buffer = malloc(largest_block);
 
 	parameter_flashfs_init(test_sector_map, buffer, largest_block);

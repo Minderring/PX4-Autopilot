@@ -1,6 +1,6 @@
 ############################################################################
 #
-#   Copyright (c) 2017 PX4 Development Team. All rights reserved.
+#   Copyright (c) 2021 PX4 Development Team. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -30,24 +30,39 @@
 # POSSIBILITY OF SUCH DAMAGE.
 #
 ############################################################################
+if("${PX4_BOARD_LABEL}" STREQUAL  "bootloader")
+	add_library(drivers_board
+		bootloader_main.c
+		usb.c
+	)
+	target_link_libraries(drivers_board
+		PRIVATE
+			nuttx_arch
+			nuttx_drivers
+			bootloader
+	)
+	target_include_directories(drivers_board PRIVATE ${PX4_SOURCE_DIR}/platforms/nuttx/src/bootloader/common)
 
-if(CONFIG_ARCH_CHIP_STM32H7)
-	set(FLASHFS_SOURCE_FILE flashfs32.c)
 else()
-	set(FLASHFS_SOURCE_FILE flashfs.c)
+	add_library(drivers_board
+		i2c.cpp
+		init.c
+		led.c
+		sdio.c
+		spi.cpp
+		timer_config.cpp
+		usb.c
+	)
+	add_dependencies(drivers_board arch_board_hw_info)
+
+	target_link_libraries(drivers_board
+		PRIVATE
+			arch_io_pins
+			arch_spi
+			arch_board_hw_info
+			drivers__led
+			nuttx_arch
+			nuttx_drivers
+			px4_layer
+	)
 endif()
-
-add_library(flashparams
-	${FLASHFS_SOURCE_FILE}
-	flashparams.cpp
-)
-
-add_dependencies(flashparams prebuild_targets)
-target_compile_definitions(flashparams PRIVATE -DMODULE_NAME="flashparams")
-target_compile_options(flashparams
-	PRIVATE
-		-Wno-sign-compare # TODO: fix this
-		-Wno-cast-align # TODO: fix and enable
-)
-
-target_link_libraries(flashparams PRIVATE nuttx_arch)
