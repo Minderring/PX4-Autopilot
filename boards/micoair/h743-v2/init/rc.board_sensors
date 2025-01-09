@@ -9,8 +9,8 @@ board_adc start
 bmi088 -s -b 2 -A -R 6 start
 bmi088 -s -b 2 -G -R 6 start
 
-# # Internal SPI bus ICM42688 accel/gyro
-icm42688p -s -b 3 -R 2 start
+# # Internal SPI bus BMI270 accel/gyro
+bmi270 -s -b 3 -R 0 start
 
 # Internal baro
 spl06 -I -a 0x77 start
