@@ -50,6 +50,10 @@ DShot::DShot() :
 
 	// Avoid using the PWM failsafe params
 	_mixing_output.setAllFailsafeValues(UINT16_MAX);
+
+	// Claim esc_status instance 0 before UAVCAN starts. MAVLink ESC_INFO and
+	// ESC_STATUS streams subscribe to the first instance.
+	esc_status_pub.advertise();
 }
 
 DShot::~DShot()
@@ -288,12 +292,8 @@ void DShot::publish_esc_status(void)
 		}
 	}
 
-	if (!esc_status_pub.advertised()) {
-		esc_status_pub.advertise();
-
-	} else {
-		esc_status_pub.update();
-	}
+	// update() also advertises on the first publication.
+	esc_status_pub.update();
 
 	// reset esc online flags
 	esc_status.esc_online_flags = 0;
@@ -301,27 +301,33 @@ void DShot::publish_esc_status(void)
 
 int DShot::handle_new_bdshot_erpm(void)
 {
+	const hrt_abstime now = hrt_absolute_time();
+	static hrt_abstime last_processed = 0;
+
+	// Process the latest samples at 200 Hz instead of waiting for every
+	// channel's ready flag to be set at exactly the same time.
+	if (now - last_processed < 5_ms) {
+		return 0;
+	}
+
+	last_processed = now;
+
 	int num_erpms = 0;
 	int telemetry_index = 0;
 	int erpm;
 	esc_status_s &esc_status = esc_status_pub.get();
 
-	esc_status.timestamp = hrt_absolute_time();
+	esc_status.timestamp = now;
 	esc_status.counter = _esc_status_counter++;
 	esc_status.esc_connectiontype = esc_status_s::ESC_CONNECTION_TYPE_DSHOT;
 	esc_status.esc_armed_flags = _outputs_on;
-
-	// We wait until all are ready.
-	if (up_bdshot_num_erpm_ready() < _num_motors) {
-		return 0;
-	}
 
 	for (unsigned i = 0; i < _num_outputs; i++) {
 		if (_mixing_output.isFunctionSet(i)) {
 			if (up_bdshot_get_erpm(i, &erpm) == 0) {
 				num_erpms++;
 				esc_status.esc_online_flags |= 1 << telemetry_index;
-				esc_status.esc[telemetry_index].timestamp = hrt_absolute_time();
+				esc_status.esc[telemetry_index].timestamp = now;
 				esc_status.esc[telemetry_index].esc_rpm = (erpm * 100) / (_param_mot_pole_count.get() / 2);
 				esc_status.esc[telemetry_index].actuator_function = _actuator_functions[telemetry_index];
 			}
@@ -378,6 +384,20 @@ bool DShot::updateOutputs(uint16_t outputs[MAX_ACTUATORS],
 	if (!_outputs_on) {
 		return false;
 	}
+
+#if defined(BOARD_BDSHOT_MIN_FRAME_INTERVAL_US)
+	if (_bidirectional_dshot_enabled) {
+		const hrt_abstime now = hrt_absolute_time();
+
+		if (_last_bdshot_frame_time != 0 &&
+		    now - _last_bdshot_frame_time < BOARD_BDSHOT_MIN_FRAME_INTERVAL_US) {
+			++_bdshot_rate_limit_skips;
+			return true;
+		}
+
+		_last_bdshot_frame_time = now;
+	}
+#endif
 
 	int requested_telemetry_index = -1;
 
@@ -723,6 +743,10 @@ int DShot::print_status()
 	PX4_INFO("Outputs initialized: %s", _outputs_initialized ? "yes" : "no");
 	PX4_INFO("Outputs used: 0x%" PRIx32, _output_mask);
 	PX4_INFO("Outputs on: %s", _outputs_on ? "yes" : "no");
+#if defined(BOARD_BDSHOT_MIN_FRAME_INTERVAL_US)
+	PX4_INFO("BDShot min period: %u us (rate-limit skips %lu)",
+		 (unsigned)BOARD_BDSHOT_MIN_FRAME_INTERVAL_US, (unsigned long)_bdshot_rate_limit_skips);
+#endif
 	perf_print_counter(_cycle_perf);
 	perf_print_counter(_bdshot_rpm_perf);
 	perf_print_counter(_dshot_telem_perf);

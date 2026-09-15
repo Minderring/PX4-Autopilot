@@ -33,6 +33,20 @@
 
 #include <px4_arch/io_timer_hw_description.h>
 
+static constexpr timer_io_channels_t initBidirectionalDShotChannel(
+	const io_timers_t timers_conf[MAX_IO_TIMERS], Timer::TimerChannel timer, GPIO::GPIOPin pin)
+{
+	timer_io_channels_t channel = initIOTimerChannel(timers_conf, timer, pin);
+
+	// Hold the inverted-DShot idle level while changing between output and capture,
+	// and limit the GPIO edge rate to reduce ringing on the bidirectional signal.
+	channel.gpio_in = (channel.gpio_in & ~(GPIO_SPEED_MASK | GPIO_PUPD_MASK)) |
+			  GPIO_SPEED_25MHz | GPIO_PULLUP;
+	channel.gpio_out = (channel.gpio_out & ~(GPIO_SPEED_MASK | GPIO_PUPD_MASK)) |
+			   GPIO_SPEED_25MHz | GPIO_PULLUP;
+	return channel;
+}
+
 constexpr io_timers_t io_timers[MAX_IO_TIMERS] = {
 	initIOTimer(Timer::Timer1, DMA{DMA::Index1}),
 	initIOTimer(Timer::Timer2, DMA{DMA::Index1}),
@@ -42,10 +56,10 @@ constexpr io_timers_t io_timers[MAX_IO_TIMERS] = {
 };
 
 constexpr timer_io_channels_t timer_io_channels[MAX_TIMER_IO_CHANNELS] = {
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel1}, {GPIO::PortE, GPIO::Pin9}),
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel2}, {GPIO::PortE, GPIO::Pin11}),
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel3}, {GPIO::PortE, GPIO::Pin13}),
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel4}, {GPIO::PortE, GPIO::Pin14}),
+	initBidirectionalDShotChannel(io_timers, {Timer::Timer1, Timer::Channel1}, {GPIO::PortE, GPIO::Pin9}),
+	initBidirectionalDShotChannel(io_timers, {Timer::Timer1, Timer::Channel2}, {GPIO::PortE, GPIO::Pin11}),
+	initBidirectionalDShotChannel(io_timers, {Timer::Timer1, Timer::Channel3}, {GPIO::PortE, GPIO::Pin13}),
+	initBidirectionalDShotChannel(io_timers, {Timer::Timer1, Timer::Channel4}, {GPIO::PortE, GPIO::Pin14}),
 	initIOTimerChannel(io_timers, {Timer::Timer2, Timer::Channel3}, {GPIO::PortB, GPIO::Pin10}),
 	initIOTimerChannel(io_timers, {Timer::Timer2, Timer::Channel4}, {GPIO::PortB, GPIO::Pin11}),
 	initIOTimerChannel(io_timers, {Timer::Timer3, Timer::Channel3}, {GPIO::PortB, GPIO::Pin0}),
