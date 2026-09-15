@@ -527,51 +527,49 @@ void io_timer_update_dma_req(uint8_t timer, bool enable)
 
 void io_timer_capture_dma_req(uint8_t timer, uint8_t timer_channel_index, bool enable)
 {
+	uint32_t dma_request_bit = 0;
+	uint32_t capture_event_bit = 0;
+	uint32_t status_mask = 0;
+
+	switch (timer_channel_index) {
+	case 0:
+		dma_request_bit = ATIM_DIER_CC1DE;
+		capture_event_bit = ATIM_EGR_CC1G;
+		status_mask = GTIM_SR_CC1IF | GTIM_SR_CC1OF;
+		break;
+
+	case 1:
+		dma_request_bit = ATIM_DIER_CC2DE;
+		capture_event_bit = ATIM_EGR_CC2G;
+		status_mask = GTIM_SR_CC2IF | GTIM_SR_CC2OF;
+		break;
+
+	case 2:
+		dma_request_bit = ATIM_DIER_CC3DE;
+		capture_event_bit = ATIM_EGR_CC3G;
+		status_mask = GTIM_SR_CC3IF | GTIM_SR_CC3OF;
+		break;
+
+	case 3:
+		dma_request_bit = ATIM_DIER_CC4DE;
+		capture_event_bit = ATIM_EGR_CC4G;
+		status_mask = GTIM_SR_CC4IF | GTIM_SR_CC4OF;
+		break;
+
+	default:
+		return;
+	}
+
 	if (enable) {
-		switch (timer_channel_index) {
-		case 0:
-			rDIER(timer) |= ATIM_DIER_CC1DE;
-			rEGR(timer)  |= (ATIM_EGR_UG | ATIM_EGR_CC1G);
-			break;
-
-		case 1:
-			rDIER(timer) |= ATIM_DIER_CC2DE;
-			rEGR(timer)  |= (ATIM_EGR_UG | ATIM_EGR_CC2G);
-			break;
-
-		case 2:
-			rDIER(timer) |= ATIM_DIER_CC3DE;
-			rEGR(timer)  |= (ATIM_EGR_UG | ATIM_EGR_CC3G);
-			break;
-
-		case 3:
-			rDIER(timer) |= ATIM_DIER_CC4DE;
-			rEGR(timer)  |= (ATIM_EGR_UG | ATIM_EGR_CC4G);
-			break;
-		}
+		// The DMA stream is already running here. Clear stale state, enable the
+		// request, then generate one deterministic capture sample as a sentinel.
+		rDIER(timer) &= ~dma_request_bit;
+		rSR(timer) = ~status_mask;
+		rDIER(timer) |= dma_request_bit;
+		rEGR(timer) = capture_event_bit;
 
 	} else {
-		switch (timer_channel_index) {
-		case 0:
-			rEGR(timer)  &= ~(ATIM_EGR_UG | ATIM_EGR_CC1G);
-			rDIER(timer) &= ~ATIM_DIER_CC1DE;
-			break;
-
-		case 1:
-			rEGR(timer)  &= ~(ATIM_EGR_UG | ATIM_EGR_CC2G);
-			rDIER(timer) &= ~ATIM_DIER_CC2DE;
-			break;
-
-		case 2:
-			rEGR(timer)  &= ~(ATIM_EGR_UG | ATIM_EGR_CC3G);
-			rDIER(timer) &= ~ATIM_DIER_CC3DE;
-			break;
-
-		case 3:
-			rEGR(timer)  &= ~(ATIM_EGR_UG | ATIM_EGR_CC4G);
-			rDIER(timer) &= ~ATIM_DIER_CC4DE;
-			break;
-		}
+		rDIER(timer) &= ~dma_request_bit;
 	}
 }
 
@@ -597,7 +595,8 @@ int io_timer_set_dshot_burst_mode(uint8_t timer, unsigned dshot_pwm_freq, uint8_
 	}
 
 	if (OK == ret_val) {
-		rARR(timer)  = DSHOT_MOTOR_PWM_BIT_WIDTH;
+		// The up-counter period is ARR + 1 timer ticks.
+		rARR(timer)  = DSHOT_MOTOR_PWM_BIT_WIDTH - 1u;
 		rPSC(timer)  = ((int)(io_timers[timer].clock_freq / dshot_pwm_freq) / DSHOT_MOTOR_PWM_BIT_WIDTH) - 1;
 		rEGR(timer)  = ATIM_EGR_UG;
 
@@ -636,34 +635,41 @@ int io_timer_set_dshot_capture_mode(uint8_t timer, uint8_t timer_channel_index, 
 	rARR(timer) = 0xFFFFFFFF;
 	// Timer Prescalar
 	rPSC(timer) = ((int)(io_timers[timer].clock_freq / (dshot_pwm_freq * 5 / 4)) / DSHOT_MOTOR_PWM_BIT_WIDTH) - 1;
+	// Load the prescaler and reset the counter. The capture sentinel is
+	// generated later, after the DMA stream has been started.
+	rEGR(timer) = ATIM_EGR_UG;
 
 	switch (timer_channel_index) {
 	case 0:
-		rEGR(timer) |= ATIM_EGR_UG | GTIM_EGR_CC1G;
 		rCCER(timer) &= ~(GTIM_CCER_CC1E | GTIM_CCER_CC1P | HW_GTIM_CCER_CC1NP);
-		rCCMR1(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR1_CC1S_SHIFT);
+		rCCMR1(timer) &= ~(GTIM_CCMR1_CC1S_MASK | GTIM_CCMR1_IC1PSC_MASK | GTIM_CCMR1_IC1F_MASK);
+		rCCMR1(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR1_CC1S_SHIFT)
+				 | (GTIM_CCMR_ICF_FCKINT4 << GTIM_CCMR1_IC1F_SHIFT);
 		rCCER(timer) |= (GTIM_CCER_CC1E | GTIM_CCER_CC1P | HW_GTIM_CCER_CC1NP);
 
 		break;
 
 	case 1:
-		rEGR(timer) |= ATIM_EGR_UG | GTIM_EGR_CC2G;
 		rCCER(timer) &= ~(GTIM_CCER_CC2E | GTIM_CCER_CC2P | HW_GTIM_CCER_CC2NP);
-		rCCMR1(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR1_CC2S_SHIFT);
+		rCCMR1(timer) &= ~(GTIM_CCMR1_CC2S_MASK | GTIM_CCMR1_IC2PSC_MASK | GTIM_CCMR1_IC2F_MASK);
+		rCCMR1(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR1_CC2S_SHIFT)
+				 | (GTIM_CCMR_ICF_FCKINT4 << GTIM_CCMR1_IC2F_SHIFT);
 		rCCER(timer) |= (GTIM_CCER_CC2E | GTIM_CCER_CC2P | HW_GTIM_CCER_CC2NP);
 		break;
 
 	case 2:
-		rEGR(timer) |= ATIM_EGR_UG | GTIM_EGR_CC3G;
 		rCCER(timer) &= ~(GTIM_CCER_CC3E | GTIM_CCER_CC3P | HW_GTIM_CCER_CC3NP);
-		rCCMR2(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR2_CC3S_SHIFT);
+		rCCMR2(timer) &= ~(GTIM_CCMR2_CC3S_MASK | GTIM_CCMR2_IC3PSC_MASK | GTIM_CCMR2_IC3F_MASK);
+		rCCMR2(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR2_CC3S_SHIFT)
+				 | (GTIM_CCMR_ICF_FCKINT4 << GTIM_CCMR2_IC3F_SHIFT);
 		rCCER(timer) |= (GTIM_CCER_CC3E | GTIM_CCER_CC3P | HW_GTIM_CCER_CC3NP);
 		break;
 
 	case 3:
-		rEGR(timer) |= ATIM_EGR_UG | GTIM_EGR_CC4G;
 		rCCER(timer) &= ~(GTIM_CCER_CC4E | GTIM_CCER_CC4P | HW_GTIM_CCER_CC4NP);
-		rCCMR2(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR2_CC4S_SHIFT);
+		rCCMR2(timer) &= ~(GTIM_CCMR2_CC4S_MASK | GTIM_CCMR2_IC4PSC_MASK | GTIM_CCMR2_IC4F_MASK);
+		rCCMR2(timer) |= (GTIM_CCMR_CCS_CCIN1 << GTIM_CCMR2_CC4S_SHIFT)
+				 | (GTIM_CCMR_ICF_FCKINT4 << GTIM_CCMR2_IC4F_SHIFT);
 		rCCER(timer) |= (GTIM_CCER_CC4E | GTIM_CCER_CC4P | HW_GTIM_CCER_CC4NP);
 		break;
 	}
@@ -884,9 +890,14 @@ int io_timer_channel_init(unsigned channel, io_timer_channel_mode_t mode,
 #if !defined(BOARD_HAS_NO_CAPTURE)
 
 	case IOTimerChanMode_Capture:
-	case IOTimerChanMode_CaptureDMA:
 		setbits = CCMR_C1_CAPTURE_INIT;
 		gpio = timer_io_channels[channel].gpio_in;
+		break;
+
+	case IOTimerChanMode_CaptureDMA:
+		dier_setbits = 0;
+		setbits = CCMR_C1_CAPTURE_INIT;
+		gpio = timer_io_channels[channel].gpio_in | GPIO_PULLUP;
 		break;
 #endif
 
@@ -965,7 +976,9 @@ int io_timer_channel_init(unsigned channel, io_timer_channel_mode_t mode,
 #else
 		channel_handlers[channel].callback = channel_handler;
 		channel_handlers[channel].context = context;
-		rDIER(timer) |= dier_setbits << shifts;
+		// DMA capture uses CCxDE and must not retain a CC interrupt enable
+		// from a previous input-capture configuration.
+		rDIER(timer) = (rDIER(timer) & ~(GTIM_DIER_CC1IE << shifts)) | (dier_setbits << shifts);
 #endif
 	}
 
@@ -1002,11 +1015,12 @@ int io_timer_set_enable(bool state, io_timer_channel_mode_t mode, io_timer_chann
 
 	case IOTimerChanMode_Dshot:
 	case IOTimerChanMode_DshotInverted:
-		dier_bit = 0;
-
-	/* fallthrough */
-	case IOTimerChanMode_Capture:
 	case IOTimerChanMode_CaptureDMA:
+		dier_bit = 0;
+		cr1_bit  = state ? GTIM_CR1_CEN : 0;
+		break;
+
+	case IOTimerChanMode_Capture:
 		cr1_bit  = state ? GTIM_CR1_CEN : 0;
 
 	/* fallthrough */

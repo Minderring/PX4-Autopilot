@@ -159,6 +159,8 @@ private:
 	bool _outputs_on{false};
 	bool _waiting_for_esc_info{false};
 	bool _bidirectional_dshot_enabled{false};
+	hrt_abstime _last_bdshot_frame_time{0};
+	uint32_t _bdshot_rate_limit_skips{0};
 
 	static constexpr unsigned _num_outputs{DIRECT_PWM_OUTPUT_CHANNELS};
 	uint32_t _output_mask{0};

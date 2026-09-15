@@ -109,6 +109,9 @@
 
 #define BOARD_HAS_PWM  DIRECT_PWM_OUTPUT_CHANNELS
 
+// Leave enough time for the complete bidirectional send/capture transaction.
+#define BOARD_BDSHOT_MIN_FRAME_INTERVAL_US 250
+
 
 /* USB OTG FS
  *
